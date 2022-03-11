@@ -35,12 +35,13 @@ func New(url string, dir string) *HlsDump {
 
 func (hd *HlsDump) Start() {
 	tr := &http.Transport{
+		Proxy:             http.ProxyFromEnvironment,
 		DisableKeepAlives: false,
 	}
 
 	c := http.Client{
 		Transport: tr,
-		Timeout:   10 * time.Second,
+		Timeout:   15 * time.Second,
 	}
 
 	resp, err := c.Get(hd.Url)

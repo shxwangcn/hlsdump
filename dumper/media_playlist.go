@@ -154,7 +154,7 @@ func (mp *MediaPlaylist) refreshPlaylist() ([]*SegmentInfo, error) {
 		}
 
 		if strings.HasPrefix(line, "#EXT-X-MEDIA-SEQUENCE:") {
-			sn, err := strconv.ParseInt(strings.TrimPrefix(line, "EXT-X-MEDIA-SEQUENCE:"), 10, 32)
+			sn, err := strconv.ParseInt(strings.TrimPrefix(line, "#EXT-X-MEDIA-SEQUENCE:"), 10, 32)
 			if err != nil {
 				fmt.Printf("[%s] invalid media seqnuence:%s\n", mp.Uri, line)
 				return nil, errors.New("InvalidMediaSequence")

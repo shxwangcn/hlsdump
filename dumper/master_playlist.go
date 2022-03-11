@@ -48,7 +48,7 @@ func NewMasterPlaylist(urlstr string, dir string) *MasterPlaylist {
 
 	c := &http.Client{
 		Transport: tr,
-		Timeout:   10 * time.Second,
+		Timeout:   15 * time.Second,
 	}
 
 	dirPos := strings.LastIndex(urlstr, "/")
@@ -143,7 +143,11 @@ func parseHlsAttrList(attrstr string) map[string]string {
 			epos = strings.Index(attrstr[bpos:], ",")
 		} else {
 			epos = strings.Index(attrstr[bpos:], ",")
-			value = attrstr[bpos : bpos+epos]
+			if epos > 0 {
+				value = attrstr[bpos : bpos+epos]
+			} else {
+				value = attrstr[bpos:]
+			}
 		}
 		bpos += epos + 1
 		attrs[key] = value
