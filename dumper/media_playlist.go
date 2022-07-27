@@ -2,16 +2,28 @@ package dumper
 
 import (
 	"bufio"
+	"bytes"
 	"errors"
 	"fmt"
+	"hlsdump/pkg/logger"
 	"io"
 	"math"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
 	"time"
+
+	"go.uber.org/zap"
 )
+
+type MediaPlaylistConfig struct {
+	urlstr  string
+	dir     string
+	retry   int
+	timeout int
+}
 
 type SegmentInfo struct {
 	Seqno     int64
@@ -24,7 +36,8 @@ type SegmentInfo struct {
 }
 
 type MediaPlaylist struct {
-	Url            string
+	cfg            MediaPlaylistConfig
+	tm             *TaskManager
 	Uri            string
 	DirUrl         string
 	Dir            string
@@ -34,34 +47,53 @@ type MediaPlaylist struct {
 	Seqno          int64 // next media sequence number
 	TargetDuration int64
 	Segments       []*SegmentInfo // only keep segments in latest m3u8(at least 5)
+	faildCount     int
 }
 
-func NewMediaPlaylist(urlstr string, uri string, dir string) *MediaPlaylist {
-	tr := &http.Transport{
-		DisableKeepAlives: false,
-		Proxy:             http.ProxyFromEnvironment,
-	}
-	c := &http.Client{
-		Transport: tr,
-		Timeout:   30 * time.Second,
-	}
-
-	dir = fmt.Sprintf("%s-%d", dir, time.Now().Unix())
-	err := os.MkdirAll(dir, 0700)
-	if err != nil {
-		fmt.Printf("mkdir for %s failed, err:%v\n", dir, err)
+func NewMediaPlaylist(c *MediaPlaylistConfig) *MediaPlaylist {
+	log := logger.Inst()
+	if !strings.HasPrefix(c.urlstr, "http") {
+		log.Warn("url is not http/https, do you want to dump a local media file??", zap.String("url", c.urlstr))
 		return nil
 	}
 
-	dirPos := strings.LastIndex(urlstr, "/")
-	dirUrl := urlstr[:dirPos]
+	urlobj, err := url.Parse(c.urlstr)
+	if err != nil {
+		log.Error("invalid url string", zap.String("url", c.urlstr), zap.Error(err))
+		return nil
+	}
+	uri := urlobj.Path
+
+	tr := &http.Transport{
+		DisableKeepAlives:   false,
+		MaxConnsPerHost:     3,
+		MaxIdleConnsPerHost: 3,
+		Proxy:               http.ProxyFromEnvironment,
+	}
+	httpc := &http.Client{
+		Transport: tr,
+		Timeout:   time.Duration(c.timeout) * time.Second,
+	}
+
+	dir := fmt.Sprintf("%s-%d", c.dir, time.Now().Unix())
+	err = os.MkdirAll(dir, 0700)
+	if err != nil {
+		log.Error("mkdir failed", zap.String("dir", dir), zap.Error(err))
+		return nil
+	}
+
+	dirPos := strings.LastIndex(c.urlstr, "/")
+	dirUrl := c.urlstr[:dirPos]
+
+	tm := NewTaskManager(c.retry, c.timeout)
 
 	mp := &MediaPlaylist{
-		Url:    urlstr,
+		cfg:    *c,
 		Uri:    uri,
 		DirUrl: dirUrl,
 		Dir:    dir,
-		client: c,
+		client: httpc,
+		tm:     tm,
 	}
 	return mp
 }
@@ -75,28 +107,53 @@ func (mp *MediaPlaylist) Type() int {
 }
 
 func (mp *MediaPlaylist) Load() {
-	fmt.Printf("target is a media playlist, now start loading!\n")
+	log := logger.Inst()
+
+	log.Info("now start loading", zap.String("url", mp.cfg.urlstr), zap.String("output dir", mp.Dir))
 	mp.load()
 }
 
 func (mp *MediaPlaylist) load() {
+	log := logger.Inst()
+
+	mp.tm.Run()
+
 	m3u8File, err := os.OpenFile(mp.Dir+"/index.m3u8", os.O_RDWR|os.O_CREATE, 0600)
 	if err != nil {
-		fmt.Printf("[%s] open index.m3u8 failed, err:%v\n", mp.Uri, err)
+		log.Error("open index.m3u8 failed", zap.String("variant", mp.Uri), zap.Error(err))
 		return
 	}
 	mp.m3u8File = m3u8File
+
+	lastUpdatedTs := time.Now().UnixMilli()
 
 	for {
 		segments, err := mp.refreshPlaylist()
 		m3u8File.Sync()
 		if err != nil && err != io.EOF {
-			fmt.Printf("refresh playlist failed, err:%v\n", err)
+			log.Error("refresh playlist failed", zap.String("variant", mp.Uri), zap.Error(err))
 			break
 		}
 
+		now := time.Now().UnixMilli()
+
+		if len(segments) == 0 {
+			stuckDuration := now - lastUpdatedTs
+			log.Warn("playlist has been stuck for a while",
+				zap.String("variant", mp.Uri),
+				zap.Int64("duration(ms)", stuckDuration),
+				zap.Int64("TargetDuration", mp.TargetDuration),
+			)
+		} else {
+			lastUpdatedTs = now
+		}
+
 		for _, ts := range segments {
-			fmt.Printf("[%s] New segment found, name:%s, duration:%f, uri:%s\n", mp.Uri, ts.Name, ts.Duration, ts.URI)
+			log.Info("New segment found", zap.String("variant", mp.Uri),
+				zap.String("name", ts.Name),
+				zap.Float64("duration", ts.Duration),
+				zap.String("uri", ts.URI),
+			)
 
 			mp.m3u8File.WriteString(fmt.Sprintf("##%s\n", ts.URI))
 			mp.m3u8File.WriteString(ts.INF + "\n")
@@ -107,29 +164,50 @@ func (mp *MediaPlaylist) load() {
 			if !strings.HasPrefix(tsurl, "http") {
 				tsurl = fmt.Sprintf("%s/%s", mp.DirUrl, tsurl)
 			}
-			err = mp.downloadSegment(tsurl, ts.Seqno)
-			if err != nil {
-				fmt.Printf("[%s] download segment failed, seqno:%d, duration:%f, uri:%s\n", mp.Uri, mp.Seqno, ts.Duration, tsurl)
-			}
-
+			filename := fmt.Sprintf("%s/%d.ts", mp.Dir, ts.Seqno)
+			mp.tm.Push(&Task{url: tsurl, filename: filename})
 		}
 
 		if err == io.EOF {
-			fmt.Printf("[%s] load complete!\n", mp.Uri)
+			log.Info("load complete!", zap.String("variant", mp.Uri))
 			break
 		}
 
-		time.Sleep(time.Duration(mp.TargetDuration * int64(time.Second)))
+		sleep := mp.TargetDuration
+		if sleep < 1 {
+			sleep = 1
+		}
+		time.Sleep(time.Duration(sleep * int64(time.Second)))
 	}
 
+	mp.tm.Stop()
 	m3u8File.Close()
+	log.Info("load complete!")
 }
 
 func (mp *MediaPlaylist) refreshPlaylist() ([]*SegmentInfo, error) {
-	resp, err := mp.client.Get(mp.Url)
+	log := logger.Inst()
+	start := time.Now().UnixMilli()
+
+	resp, err := mp.client.Get(mp.cfg.urlstr)
 	if err != nil {
-		fmt.Printf("load master playlist failed, err:%v\n", err)
 		return nil, err
+	}
+	end := time.Now().UnixMilli()
+	if resp.StatusCode != 200 {
+		log.Warn("refresh playlist failed",
+			zap.String("variant", mp.Uri),
+			zap.Int64("start_ts", start),
+			zap.Int64("end_ts", end),
+			zap.Int64("delay", end-start),
+			zap.Int("StatusCode", resp.StatusCode),
+		)
+		mp.faildCount++
+		if mp.faildCount > 3 {
+			return nil, errors.New(resp.Status)
+		}
+	} else {
+		mp.faildCount = 0
 	}
 
 	defer resp.Body.Close()
@@ -141,26 +219,33 @@ func (mp *MediaPlaylist) refreshPlaylist() ([]*SegmentInfo, error) {
 
 	segments := make([]*SegmentInfo, 0, 10)
 
-	scanner := bufio.NewScanner(resp.Body)
+	bDump := false
+
+	buf := bytes.Buffer{}
+	tee := io.TeeReader(resp.Body, &buf)
+	scanner := bufio.NewScanner(tee)
 	seqno := int64(0)
+	totalCnt := 0
 	for scanner.Scan() {
 		line := scanner.Text()
+		log.Info(fmt.Sprintf("line: %s", line))
 		if bFirstLoad && strings.HasPrefix(line, "#") && !strings.HasPrefix(line, "#EXTINF") {
 			mp.m3u8File.WriteString(line + "\n")
 		}
 
 		if line == "#EXT-X-ENDLIST" {
-			return nil, io.EOF
+			return segments, io.EOF
 		}
 
 		if strings.HasPrefix(line, "#EXT-X-MEDIA-SEQUENCE:") {
 			sn, err := strconv.ParseInt(strings.TrimPrefix(line, "#EXT-X-MEDIA-SEQUENCE:"), 10, 32)
 			if err != nil {
-				fmt.Printf("[%s] invalid media seqnuence:%s\n", mp.Uri, line)
+				log.Error("invalid media seqnuence", zap.String("variant", mp.Uri), zap.String("data", line))
 				return nil, errors.New("InvalidMediaSequence")
 			}
 			if sn > mp.Seqno {
-				fmt.Printf("[%s] mediq sequence number discontinuity, expected %d but got %d\n", mp.Uri, mp.Seqno, seqno)
+				log.Error(fmt.Sprintf("media sequence number discontinuity, expected %d but got %d", mp.Seqno, sn), zap.String("variant", mp.Uri))
+				bDump = true
 			}
 			seqno = sn
 			continue
@@ -168,35 +253,39 @@ func (mp *MediaPlaylist) refreshPlaylist() ([]*SegmentInfo, error) {
 		if strings.HasPrefix(line, "#EXT-X-TARGETDURATION:") {
 			targetDuration, err := strconv.ParseInt(strings.TrimPrefix(line, "#EXT-X-TARGETDURATION:"), 10, 32)
 			if err != nil {
-				fmt.Printf("[%s] invalid target duration:%s\n", mp.Uri, line)
+				log.Error("invalid target duration", zap.String("variant", mp.Uri), zap.String("data", line))
 				return nil, errors.New("InvalidTargetDuration")
 			}
 			if mp.TargetDuration != 0 && targetDuration != mp.TargetDuration {
-				fmt.Printf("[%s] TargetDuration changed from %d to %d\n", mp.Uri, mp.TargetDuration, targetDuration)
+				log.Warn("TargetDuration changed", zap.String("variant", mp.Uri), zap.Int64("old", mp.TargetDuration), zap.Int64("new", targetDuration))
 			}
 			mp.TargetDuration = targetDuration
 			continue
 		}
 
 		if strings.HasPrefix(line, "#EXTINF:") {
+			totalCnt++
 			infstr := strings.TrimSuffix(strings.TrimPrefix(line, "#EXTINF:"), ",")
 			duration, err := strconv.ParseFloat(infstr, 32)
 			if err != nil {
-				fmt.Printf("[%s] invalid segment duration:%s\n", mp.Uri, line)
+				log.Error("invalid segment duration", zap.String("variant", mp.Uri), zap.String("data", line))
 				return nil, errors.New("InvalidMediaDuration")
 			}
 			if int64(math.Round(duration)) > mp.TargetDuration {
-				fmt.Printf("[%s] duration(%f) is larger than target duration(%d)\n", mp.Uri, duration, mp.TargetDuration)
+				log.Error("segment duration is larger than target duration", zap.String("variant", mp.Uri),
+					zap.Float64("duration", duration),
+					zap.Int64("TargetDuration", mp.TargetDuration),
+				)
 				return nil, errors.New("OverflowMediaDuration")
 			}
 
 			if !scanner.Scan() {
-				fmt.Printf("[%s] No URI for Segment, seqno:%d\n", mp.Uri, mp.Seqno)
+				log.Error("No URI for Segment", zap.String("variant", mp.Uri), zap.Int64("seqno", mp.Seqno))
 				return nil, errors.New("MissingSegmentUri")
 			}
 			uri := scanner.Text()
 			if seqno < mp.Seqno {
-				fmt.Printf("[%s] ignore old segment, seqno:%d\n", mp.Uri, seqno)
+				log.Info("ignore old segment", zap.String("variant", mp.Uri), zap.Int64("seqno", seqno), zap.Int64("currentSeqNo", mp.Seqno))
 				seqno++
 				continue
 			}
@@ -214,32 +303,17 @@ func (mp *MediaPlaylist) refreshPlaylist() ([]*SegmentInfo, error) {
 			mp.Seqno = seqno
 		}
 	}
+	if bDump {
+		log.Info("dump full playlist", zap.String("variant", mp.Uri), zap.String("data", buf.String()))
+	}
+
+	log.Info("refresh playlist done",
+		zap.String("variant", mp.Uri),
+		zap.Int("total segments", totalCnt),
+		zap.Int("new segments", len(segments)),
+		zap.Int64("start_ts", start),
+		zap.Int64("end_ts", end),
+		zap.Int64("delay", end-start),
+	)
 	return segments, nil
-}
-
-func (mp *MediaPlaylist) downloadSegment(uri string, seqno int64) error {
-	resp, err := mp.client.Get(uri)
-	if err != nil {
-		fmt.Printf("[%s] download segment failed, uri:%s, err:%v\n", mp.Uri, uri, err)
-		return err
-	}
-
-	defer resp.Body.Close()
-
-	if resp.StatusCode != 200 {
-		fmt.Printf("[%s] download %s failed, statuscode:%d\n", mp.Uri, uri, resp.StatusCode)
-	}
-
-	filename := fmt.Sprintf("%s/%d.ts", mp.Dir, seqno)
-	tsFile, err := os.OpenFile(filename, os.O_RDWR|os.O_TRUNC|os.O_CREATE, 0600)
-	if err != nil {
-		fmt.Printf("[%s] create segment file for %s failed\n", mp.Uri, filename)
-	}
-	_, err = io.Copy(tsFile, resp.Body)
-	if err != nil {
-		fmt.Printf("[%s] write segment to files failed, file:%s, err:%v\n", mp.Uri, filename, err)
-		return err
-	}
-
-	return nil
 }

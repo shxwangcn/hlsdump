@@ -4,7 +4,8 @@ import (
 	"bufio"
 	"errors"
 	"fmt"
-	"net/http"
+	"hlsdump/pkg/logger"
+	"io"
 	"os"
 	"strconv"
 	"strings"
@@ -32,44 +33,102 @@ type VariantInfo struct {
 }
 
 type MasterPlaylist struct {
-	Url      string
-	DirUrl   string
+	BaseUrl  string
 	Dir      string
-	client   *http.Client
 	Variants []*VariantInfo
-	m3u8File *os.File
 }
 
-func NewMasterPlaylist(urlstr string, dir string) *MasterPlaylist {
-	tr := &http.Transport{
-		Proxy:             http.ProxyFromEnvironment,
-		DisableKeepAlives: false,
-	}
-
-	c := &http.Client{
-		Transport: tr,
-		Timeout:   15 * time.Second,
-	}
-
-	dirPos := strings.LastIndex(urlstr, "/")
-	dirUrl := urlstr[:dirPos]
+func NewMasterPlaylist(baseurl string, body io.Reader, dir string) (*MasterPlaylist, error) {
+	log := logger.Inst()
+	dirUrl := baseurl
 
 	dir = fmt.Sprintf("%s-%d", dir, time.Now().Unix())
 
 	err := os.MkdirAll(dir, 0700)
 	if err != nil {
-		fmt.Printf("mkdir for %s failed, err:%v\n", dir, err)
-		return nil
+		log.Error(fmt.Sprintf("mkdir for %s failed, err:%v", dir, err))
+		return nil, errors.New("MakeDirFailed")
 	}
 
-	mp := &MasterPlaylist{
-		Url:      urlstr,
-		DirUrl:   dirUrl,
-		Dir:      dir,
-		client:   c,
-		Variants: make([]*VariantInfo, 0, 10),
+	m3u8File, err := os.OpenFile(dir+"/index.m3u8", os.O_RDWR|os.O_TRUNC|os.O_CREATE, 0600)
+	if err != nil {
+		fmt.Printf("open %s/index.m3u8 failed, err:%v\n", dir, err)
+		return nil, errors.New("OpenIndexFileFailed")
 	}
-	return mp
+
+	variants := make([]*VariantInfo, 0, 10)
+
+	scanner := bufio.NewScanner(body)
+	idx := 0
+	for scanner.Scan() {
+		line := scanner.Text()
+		m3u8File.WriteString(line + "\n")
+		if strings.HasPrefix(line, "#EXT-X-STREAM-INF:") {
+			attrstr := strings.TrimPrefix(line, "#EXT-X-STREAM-INF:")
+			if !scanner.Scan() {
+				fmt.Printf("No URI for Variant(%s)\n", attrstr)
+				return nil, errors.New("NoUriForVariant")
+			}
+			uri := scanner.Text()
+			fmt.Printf("found new variant, uri:%s, attrs:%s\n", uri, attrstr)
+
+			furi := uri
+			if !strings.HasPrefix(uri, "http") {
+				furi = baseurl + "/" + uri
+			}
+
+			attrs := parseHlsAttrList(attrstr)
+
+			v := &VariantInfo{
+				Url:        furi,
+				Codecs:     attrs["CODECS"],
+				Resolution: attrs["RESOLUTION"],
+				AudioGroup: attrs["AUDIO"],
+				VideoGroup: attrs["VIDEO"],
+			}
+
+			if bandwidth, ok := attrs["BANDWIDTH"]; ok {
+				v.Bandwidth, _ = strconv.ParseInt(bandwidth, 10, 64)
+				if v.Bandwidth == 0 {
+					return nil, errors.New("InvalidBandwidth")
+				}
+			} else {
+				return nil, errors.New("BandwidthNotFound")
+			}
+
+			if avgbandwidth, ok := attrs["AVERAGE-BANDWIDTH"]; ok {
+				v.AvgBandwidth, _ = strconv.ParseInt(avgbandwidth, 10, 64)
+			}
+
+			if framerate, ok := attrs["FRAME-RATE"]; ok {
+				v.FrameRate, _ = strconv.ParseFloat(framerate, 32)
+			}
+
+			name := fmt.Sprintf("%d-%d", idx, v.Bandwidth)
+			resolution, ok := attrs["RESOLUTION"]
+			if ok {
+				name += "-" + resolution[:strings.Index(resolution, "x")]
+			}
+
+			m3u8File.WriteString(fmt.Sprintf("%s/index.m3u8\n", name))
+
+			media := NewMediaPlaylist(&MediaPlaylistConfig{urlstr: furi, dir: dir + "/" + name})
+
+			v.Playlist = media
+			variants = append(variants, v)
+
+			idx++
+		}
+	}
+
+	m3u8File.Sync()
+	m3u8File.Close()
+	mp := &MasterPlaylist{
+		BaseUrl:  dirUrl,
+		Dir:      dir,
+		Variants: variants,
+	}
+	return mp, nil
 }
 
 func (mp *MasterPlaylist) Version() int {
@@ -81,44 +140,21 @@ func (mp *MasterPlaylist) Type() int {
 }
 
 func (mp *MasterPlaylist) Load() {
-	resp, err := mp.client.Get(mp.Url)
-	if err != nil {
-		fmt.Printf("load master playlist failed, err:%v\n", err)
-		return
-	}
+	log := logger.Inst()
 
-	defer resp.Body.Close()
-
-	m3u8File, err := os.OpenFile(mp.Dir+"/index.m3u8", os.O_RDWR|os.O_TRUNC|os.O_CREATE, 0600)
-	if err != nil {
-		fmt.Printf("open %s/index.m3u8 failed, err:%v\n", mp.Dir, err)
-		return
-	}
-	mp.m3u8File = m3u8File
-	fmt.Printf("target is a master playlist, now start loading!\n")
+	log.Info("target is a master playlist, now start loading!")
 
 	wg := sync.WaitGroup{}
 
-	scanner := bufio.NewScanner(resp.Body)
-	idx := 0
-	for scanner.Scan() {
-		line := scanner.Text()
-		m3u8File.WriteString(line + "\n")
-		if strings.HasPrefix(line, "#EXT-X-STREAM-INF:") {
-			attrs := strings.TrimPrefix(line, "#EXT-X-STREAM-INF:")
-			if !scanner.Scan() {
-				fmt.Printf("No URI for Variant(%s)\n", attrs)
-				return
-			}
-			uri := scanner.Text()
-			mp.addNewVariant(&wg, uri, idx, attrs)
-			idx++
-		}
+	for _, v := range mp.Variants {
+		wg.Add(1)
+		go func(v *VariantInfo) {
+			defer wg.Done()
+			v.Playlist.Load()
+		}(v)
 	}
-	mp.m3u8File.Sync()
 
 	wg.Wait()
-	mp.m3u8File.Close()
 }
 
 // attr: PROGRAM-ID=1,BANDWIDTH=246440,CODECS="mp4a.40.5,avc1.42000d",RESOLUTION=320x184,NAME="240"
@@ -159,58 +195,6 @@ func parseHlsAttrList(attrstr string) map[string]string {
 }
 
 func (mp *MasterPlaylist) addNewVariant(wg *sync.WaitGroup, uri string, idx int, attrstr string) error {
-	fmt.Printf("found new variant, uri:%s, attrs:%s\n", uri, attrstr)
-
-	furi := uri
-	if !strings.HasPrefix(uri, "http") {
-		furi = mp.DirUrl + "/" + uri
-	}
-
-	attrs := parseHlsAttrList(attrstr)
-
-	v := &VariantInfo{
-		Url:        furi,
-		Codecs:     attrs["CODECS"],
-		Resolution: attrs["RESOLUTION"],
-		AudioGroup: attrs["AUDIO"],
-		VideoGroup: attrs["VIDEO"],
-	}
-
-	if bandwidth, ok := attrs["BANDWIDTH"]; ok {
-		v.Bandwidth, _ = strconv.ParseInt(bandwidth, 10, 64)
-		if v.Bandwidth == 0 {
-			return errors.New("InvalidBandwidth")
-		}
-	} else {
-		return errors.New("BandwidthNotFound")
-	}
-
-	if avgbandwidth, ok := attrs["AVERAGE-BANDWIDTH"]; ok {
-		v.AvgBandwidth, _ = strconv.ParseInt(avgbandwidth, 10, 64)
-	}
-
-	if framerate, ok := attrs["FRAME-RATE"]; ok {
-		v.FrameRate, _ = strconv.ParseFloat(framerate, 32)
-	}
-
-	name := fmt.Sprintf("%d-%d", idx, v.Bandwidth)
-	resolution, ok := attrs["RESOLUTION"]
-	if ok {
-		name += "-" + resolution[:strings.Index(resolution, "x")]
-	}
-
-	mp.m3u8File.WriteString(fmt.Sprintf("%s/index.m3u8\n", name))
-
-	media := NewMediaPlaylist(furi, uri, mp.Dir+"/"+name)
-
-	v.Playlist = media
-	mp.Variants = append(mp.Variants, v)
-
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		media.Load()
-	}()
 
 	return nil
 }
